@@ -6,7 +6,51 @@ class FingerprintProcessor:
     A comprehensive toolkit for fingerprint image processing, enhancement, 
     skeletonization (KMM & Morphological), and minutiae extraction.
     """
+    
+    def __init__(self):
+        """
+        Initialize static lookup tables (LUTs) for the KMM algorithm upon class instantiation.
+        This saves significant computation time by preventing recalculation on every image.
+        """
+        # 1. Deletion LUT for Phase C
+        self._lut = np.zeros(256, dtype=bool)
+        self._lut[[3, 5, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31, 48,
+                   52, 53, 54, 55, 56, 60, 61, 62, 63, 65, 67, 69, 71, 77, 79, 80,
+                   81, 83, 84, 85, 86, 87, 88, 89, 91, 92, 93, 94, 95, 97, 99, 101,
+                   103, 109, 111, 112, 113, 115, 116, 117, 118, 119, 120, 121, 123, 124, 125, 126,
+                   127, 131, 133, 135, 141, 143, 149, 151, 157, 159, 181, 183, 189, 191, 192, 193,
+                   195, 197, 199, 205, 207, 208, 209, 211, 212, 213, 214, 215, 216, 217, 219, 220,
+                   221, 222, 223, 224, 225, 227, 229, 231, 237, 239, 240, 241, 243, 244, 245, 246,
+                   247, 248, 249, 251, 252, 253, 254, 255]] = True
 
+        # 2. Connected Components LUT for Phase B
+        _adjacent_neighbors = [[1, 3], [0, 2, 3, 4], [1, 4], [0, 1, 5, 6], 
+                               [1, 2, 6, 7], [3, 6], [3, 4, 5, 7], [4, 6]]
+        self._component_lut = np.zeros(256, dtype=np.uint8)
+        
+        for pattern in range(256):
+            bits = [i for i in range(8) if (pattern >> i) & 1]
+            if not bits: 
+                continue
+            
+            bit_set, visited, max_size = set(bits), set(), 0
+            for start_node in bits:
+                if start_node in visited: 
+                    continue
+                queue, size = [start_node], 0
+                visited.add(start_node)
+                
+                while queue:
+                    node = queue.pop(0)
+                    size += 1
+                    for neighbor in _adjacent_neighbors[node]:
+                        if neighbor in bit_set and neighbor not in visited:
+                            visited.add(neighbor)
+                            queue.append(neighbor)
+                max_size = max(max_size, size)
+            self._component_lut[pattern] = max_size
+
+    
     # =========================================================================
     # 1. Morphological & Utility Operations
     # =========================================================================
@@ -217,45 +261,8 @@ class FingerprintProcessor:
         Applies the KMM (Saeed, Rybnik, Tabedzki, Adamski) skeletonization algorithm 
         to reduce ridge thickness to a single pixel.
         """
-        _lut = np.zeros(256, dtype=bool)
-        _lut[[3, 5, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31, 48,
-              52, 53, 54, 55, 56, 60, 61, 62, 63, 65, 67, 69, 71, 77, 79, 80,
-              81, 83, 84, 85, 86, 87, 88, 89, 91, 92, 93, 94, 95, 97, 99, 101,
-              103, 109, 111, 112, 113, 115, 116, 117, 118, 119, 120, 121, 123, 124, 125, 126,
-              127, 131, 133, 135, 141, 143, 149, 151, 157, 159, 181, 183, 189, 191, 192, 193,
-              195, 197, 199, 205, 207, 208, 209, 211, 212, 213, 214, 215, 216, 217, 219, 220,
-              221, 222, 223, 224, 225, 227, 229, 231, 237, 239, 240, 241, 243, 244, 245, 246,
-              247, 248, 249, 251, 252, 253, 254, 255]] = True
-
-        _pad_kwargs = dict(mode='constant', constant_values=0)
-        _adjacent_neighbors = [[1, 3], [0, 2, 3, 4], [1, 4], [0, 1, 5, 6], 
-                               [1, 2, 6, 7], [3, 6], [3, 4, 5, 7], [4, 6]]
-        _component_lut = np.zeros(256, dtype=np.uint8)
-        
-        # Build Connected Components LUT for KMM phase B
-        for pattern in range(256):
-            bits = [i for i in range(8) if (pattern >> i) & 1]
-            if not bits: 
-                continue
-            
-            bit_set, visited, max_size = set(bits), set(), 0
-            for start_node in bits:
-                if start_node in visited: 
-                    continue
-                queue, size = [start_node], 0
-                visited.add(start_node)
-                
-                while queue:
-                    node = queue.pop(0)
-                    size += 1
-                    for neighbor in _adjacent_neighbors[node]:
-                        if neighbor in bit_set and neighbor not in visited:
-                            visited.add(neighbor)
-                            queue.append(neighbor)
-                max_size = max(max_size, size)
-            _component_lut[pattern] = max_size
-
         img = (binary == 0).astype(np.uint8)
+        _pad_kwargs = dict(mode='constant', constant_values=0)
 
         while True:
             previous_img = img.copy()
@@ -277,7 +284,7 @@ class FingerprintProcessor:
                          pc[1:-1, :-2] * 8  | pc[1:-1, 2:] * 16  | pc[2:, :-2] * 32 |
                          pc[2:, 1:-1] * 64  | pc[2:, 2:] * 128).astype(np.uint8)
                          
-            max_component = _component_lut[pattern_b]
+            max_component = self._component_lut[pattern_b]
             img[contour & (max_component >= 2) & (max_component <= 4)] = 0
 
             # Phase C: Sequential deletion via LUT mapping
@@ -295,7 +302,7 @@ class FingerprintProcessor:
                         if c > 0 and img[r+1, c-1]: w += 32
                         if           img[r+1, c  ]: w += 16
                         if c < W-1 and img[r+1, c+1]: w += 8
-                    img[r, c] = 0 if _lut[w] else 1
+                    img[r, c] = 0 if self._lut[w] else 1
 
             # Check convergence
             if np.array_equal(img, previous_img):
@@ -356,6 +363,74 @@ class FingerprintProcessor:
         bifurcations = [tuple(pt) for pt in np.argwhere(mask & (cn == 3))]
 
         return {'terminations': terminations, 'bifurcations': bifurcations}
+
+
+
+
+
+    # better detection ??? less false positives from broken lines
+    # added __ so we dont have 2 methods with the same name
+    def __detect_minutiae(self, skeleton: np.ndarray, margin: int = 12, spurious_dist: float = 5.0) -> dict:
+        """
+        Detects ridge endings and bifurcations using the Crossing Number method,
+        with an added post-processing step to remove spurious/false minutiae 
+        caused by broken ridges.
+        """
+        import math
+        
+        s = (skeleton == 0).astype(np.int16)
+        H, W = s.shape
+        p = np.pad(s, 1, mode='constant', constant_values=0)
+
+        # 8 neighbors collected in clockwise order
+        neighbors = np.stack([
+            p[:-2, :-2], p[:-2, 1:-1], p[:-2, 2:], p[1:-1, 2:],
+            p[2:, 2:], p[2:, 1:-1], p[2:, :-2], p[1:-1, :-2]
+        ], axis=0)
+
+        diff_sum = np.zeros((H, W), dtype=np.int16)
+        for k in range(8):
+            diff_sum += np.abs(neighbors[k] - neighbors[(k + 1) % 8])
+            
+        cn = (diff_sum // 2).astype(np.uint8)
+
+        mask = np.zeros((H, W), dtype=bool)
+        mask[margin:H - margin, margin:W - margin] = True
+        mask &= (s == 1)
+
+        raw_terminations = [tuple(pt) for pt in np.argwhere(mask & (cn == 1))]
+        bifurcations = [tuple(pt) for pt in np.argwhere(mask & (cn == 3))]
+
+        # --- Post-Processing: Remove Spurious Terminations ---
+        # If two terminations are extremely close to each other, they are likely 
+        # a single broken ridge rather than two actual minutiae.
+        valid_terminations = []
+        skip_indices = set()
+        
+        for i, t1 in enumerate(raw_terminations):
+            if i in skip_indices:
+                continue
+                
+            is_spurious = False
+            for j in range(i + 1, len(raw_terminations)):
+                if j in skip_indices:
+                    continue
+                t2 = raw_terminations[j]
+                
+                # Calculate Euclidean distance
+                dist = math.sqrt((t1[0] - t2[0])**2 + (t1[1] - t2[1])**2)
+                
+                if dist < spurious_dist:
+                    # Both are deemed spurious (a broken line)
+                    is_spurious = True
+                    skip_indices.add(j)
+                    break
+                    
+            if not is_spurious:
+                valid_terminations.append(t1)
+
+        return {'terminations': valid_terminations, 'bifurcations': bifurcations}
+
 
     def draw_minutiae(self, skeleton: np.ndarray, minutiae: dict, radius: int = 4) -> np.ndarray:
         """

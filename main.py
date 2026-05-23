@@ -132,7 +132,7 @@ class MainWindow(QMainWindow):
 
         params = {
             'threshold': 128, # próg dla kroku 6
-            'threshold_ratio': 0.5 # próg dla kroku 3 (segmentacja ROI)
+            'threshold_ratio': 0.33 # próg dla kroku 3 (segmentacja ROI)
         }
 
         self.worker = FingerprintWorker(self.original_image, self.current_step, params)
