@@ -1,357 +1,381 @@
 import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
+from PIL import Image
 
-class IrisProcessor:
-    """Klasa logiczna zawierająca algorytmy z instrukcji."""
-    
-    @staticmethod
-    def to_grayscale(img):
-        if len(img.shape) == 3:
-            return np.dot(img[...,:3], [0.299, 0.587, 0.114]).astype(np.uint8)
-        return img
+class FingerprintProcessor:
+    """
+    A comprehensive toolkit for fingerprint image processing, enhancement, 
+    skeletonization (KMM & Morphological), and minutiae extraction.
+    """
 
-    @staticmethod
-    def calculate_base_threshold(gray_img):
-        h, w = gray_img.shape
-        return np.sum(gray_img) / (h * w)
+    # =========================================================================
+    # 1. Morphological & Utility Operations
+    # =========================================================================
 
-    @staticmethod
-    def binarize(gray_img, threshold):
-        return (gray_img < threshold).astype(np.uint8) * 255
-    
-    @staticmethod
-    def filter_min_max(img, size, mode='min'):
-        pad_w = size // 2
-        pad_img = np.pad(img, pad_w, mode='edge')
-        windows = sliding_window_view(pad_img, window_shape=(size, size))
+    def _get_structuring_element(self, size: int, shape: str) -> np.ndarray:
+        """Generates a morphological structuring element of a given size and shape."""
+        size = max(3, size | 1) 
+        se = np.zeros((size, size), dtype=np.uint8)
+        c = size // 2
         
-        if mode == 'min':
-            return np.min(windows, axis=(-2, -1)).astype(np.uint8)
-        else:
-            return np.max(windows, axis=(-2, -1)).astype(np.uint8)
-        
-    @staticmethod
-    def apply_morphology(img, operation, size):
-        if "Brak" in operation:
-            return img
-        elif "Usuń rzęsy" in operation:
-            tmp = IrisProcessor.filter_min_max(img, size, 'max')
-            return IrisProcessor.filter_min_max(tmp, size, 'min')
-        elif "Zalej refleksy" in operation:
-            tmp = IrisProcessor.filter_min_max(img, size, 'min')
-            return IrisProcessor.filter_min_max(tmp, size, 'max')
-        elif "Tylko powiększ czarne" in operation:
-            return IrisProcessor.filter_min_max(img, size, 'min')
-        elif "Tylko powiększ białe" in operation:
-            return IrisProcessor.filter_min_max(img, size, 'max')
-        return img
-
-    @staticmethod
-    def find_center_and_radius_via_projections(binary_img):
-        THRESHOLD_RATIO = 0.9
-        
-        inverted = np.where(binary_img == 0, 1, 0)
-        
-        proj_y = np.sum(inverted, axis=1)
-        proj_x = np.sum(inverted, axis=0)
-        
-        def get_bounds(proj):
-            max_val = np.max(proj)
-            if max_val == 0:
-                return 0, 0
+        if shape == 'ellipse':
+            Y, X = np.ogrid[:size, :size]
+            se[(Y - c) ** 2 + (X - c) ** 2 <= c ** 2] = 1
+        elif shape == 'cross':
+            se[c, :] = se[:, c] = 1
+        elif shape == 'square':
+            se[:] = 1
             
-            threshold = max_val * THRESHOLD_RATIO * 0.2
-            valid_indices = np.where(proj > threshold)[0]
-            if len(valid_indices) == 0:
-                return 0, 0
+        return se
+
+    def _to_gray(self, image) -> np.ndarray:
+        """Converts an input image (PIL or Numpy) to a 2D grayscale numpy array."""
+        if isinstance(image, np.ndarray):
+            if len(image.shape) == 3:
+                return np.dot(image[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
+            return image
+        return np.array(image.convert('L'))
+
+    def _erode(self, img: np.ndarray, se: np.ndarray) -> np.ndarray:
+        """Performs morphological erosion (local minimum) on the image."""
+        pad = se.shape[0] // 2
+        p = np.pad(img, pad, mode='edge')
+        out = np.full_like(img, 255)
+        for di, dj in np.argwhere(se):
+            out = np.minimum(out, p[di:di + img.shape[0], dj:dj + img.shape[1]])
+        return out
+
+    def _dilate(self, img: np.ndarray, se: np.ndarray) -> np.ndarray:
+        """Performs morphological dilation (local maximum) on the image."""
+        pad = se.shape[0] // 2
+        p = np.pad(img, pad, mode='edge')
+        out = np.zeros_like(img)
+        for di, dj in np.argwhere(se):
+            out = np.maximum(out, p[di:di + img.shape[0], dj:dj + img.shape[1]])
+        return out
+
+    def _open(self, img: np.ndarray, se: np.ndarray) -> np.ndarray:
+        """Performs morphological opening (erosion followed by dilation)."""
+        return self._dilate(self._erode(img, se), se)
+
+    def _close(self, img: np.ndarray, se: np.ndarray) -> np.ndarray:
+        """Performs morphological closing (dilation followed by erosion)."""
+        return self._erode(self._dilate(img, se), se)
+
+    def _convolve2d(self, img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+        """Applies a 2D linear convolution using Fast Fourier Transform (FFT)."""
+        sh = tuple(int(2 ** np.ceil(np.log2(s + k - 1))) for s, k in zip(img.shape, kernel.shape))
+        out = np.real(np.fft.ifft2(
+            np.fft.fft2(img.astype(np.float64), sh) *
+            np.fft.fft2(kernel.astype(np.float64), sh)
+        ))
+        ph, pw = kernel.shape[0] // 2, kernel.shape[1] // 2
+        return out[ph: ph + img.shape[0], pw: pw + img.shape[1]]
+
+
+    # =========================================================================
+    # 2. Image Enhancement & Gabor Filtering
+    # =========================================================================
+
+    def normalize(self, gray: np.ndarray, M0: float = 100.0, V0: float = 100.0) -> np.ndarray:
+        """Normalizes the image to a desired global mean (M0) and variance (V0)."""
+        f = gray.astype(np.float64)
+        M = f.mean()
+        V = f.var()
+        diff = f - M
+        norm = np.where(
+            diff >= 0,
+            M0 + np.sqrt(V0 * (diff ** 2) / (V + 1e-8)),
+            M0 - np.sqrt(V0 * (diff ** 2) / (V + 1e-8)),
+        )
+        return np.clip(norm, 0, 255).astype(np.uint8)
+
+    def _estimate_orientation(self, gray: np.ndarray, block: int = 16) -> np.ndarray:
+        """Estimates the local ridge orientation map of the fingerprint."""
+        Kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], float)
+        gx = self._convolve2d(gray.astype(float), Kx)
+        gy = self._convolve2d(gray.astype(float), Kx.T)
+        
+        Vx = 2.0 * gx * gy
+        Vy = gx ** 2 - gy ** 2
+        H, W = gray.shape
+        orientation = np.zeros((H, W), float)
+        
+        for r in range(0, H, block):
+            for c in range(0, W, block):
+                bvx = Vx[r:r + block, c:c + block].mean()
+                bvy = Vy[r:r + block, c:c + block].mean()
+                orientation[r:r + block, c:c + block] = 0.5 * np.arctan2(bvx, bvy) + np.pi / 2.0
                 
-            return valid_indices[0], valid_indices[-1]
-            
-        top, bottom = get_bounds(proj_y)
-        left, right = get_bounds(proj_x)
-        
-        radius_x = (right - left) / 2
-        radius_y = (bottom - top) / 2
-        radius = int((radius_x + radius_y) / 2)
-        
-        max_y = np.max(proj_y)
-        y_indices = np.where((proj_y <= max_y) & (proj_y > max_y * THRESHOLD_RATIO))[0]
-        center_y = int(np.mean(y_indices)) 
-        
-        proj_x = np.sum(inverted, axis=0)
-        max_x = np.max(proj_x)
-        x_indices = np.where((proj_x <= max_x) & (proj_x > max_x * THRESHOLD_RATIO))[0]
-        center_x = int(np.mean(x_indices))
+        return orientation
 
-        return center_x, center_y, radius
+    def _gabor_kernel(self, size: int, theta: float, freq: float, sigma_perp: float, sigma_par: float) -> np.ndarray:
+        """Generates a directional Gabor kernel based on spatial frequency and orientation."""
+        h = size // 2
+        x, y = np.meshgrid(np.arange(-h, h + 1), np.arange(-h, h + 1))
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        
+        xr = -x * sin_t + y * cos_t
+        yr =  x * cos_t + y * sin_t
+        
+        kernel = (np.exp(-0.5 * (xr ** 2 / sigma_perp ** 2 + yr ** 2 / sigma_par ** 2)) 
+                  * np.cos(2.0 * np.pi * freq * xr))
+        kernel -= kernel.mean()
+        return kernel
 
-    @staticmethod
-    def find_center_and_radius_via_n_projections(binary_img, n_angles=7):
-        """
-        Wyznacza środek i promień źrenicy wykonując n projekcji pod różnymi kątami.
-        Wersja używająca czystego NumPy i rzutowania współrzędnych (bez obracania obrazu).
-        """
-        threshold_1 = 0.33 # Procent piku histogramu, poniżej którego uznajemy, że to szum
-        threshold_2 = 0.1 # Procent piku projekcji, poniżej którego uznajemy, że to szum
-        
-        inverted = np.where(binary_img == 0, 1, 0).astype(np.uint8)
-        h, w = inverted.shape
-        
-        intersection_mask = np.ones((h, w), dtype=np.uint8)
-        
-        y_grid, x_grid = np.indices((h, w))
-        
-        active_y, active_x = np.where(inverted == 1)
-        
-        if len(active_x) == 0:
-            return 0, 0, 0
-            
+    def gabor_enhance(self, gray: np.ndarray, n_angles: int, freq: float, ksize: int, sigma_perp: float, sigma_par: float) -> np.ndarray:
+        """Enhances fingerprint ridges using a directional Gabor filter bank."""
+        f = gray.astype(np.float64)
+        f = (f.max() - f) / (f.max() - f.min() + 1e-8)
+
         angles = np.linspace(0, np.pi, n_angles, endpoint=False)
+        kernels = [self._gabor_kernel(ksize, t, freq, sigma_perp, sigma_par) for t in angles]
+        resps = np.stack([self._convolve2d(f, k) for k in kernels])
+
+        orientation = self._estimate_orientation(gray)
+        idx = np.round((orientation % np.pi) / np.pi * n_angles).astype(int) % n_angles
+
+        rows = np.arange(gray.shape[0])[:, None]
+        cols = np.arange(gray.shape[1])[None, :]
+        picked = resps[idx, rows, cols]
+
+        picked -= picked.min()
+        picked /= (picked.max() + 1e-8)
+        return picked
+
+    def _compute_roi(self, gray: np.ndarray, block: int = 16, threshold_ratio: float = 0.2, morph_size: int = 33) -> np.ndarray:
+        """Calculates the Region of Interest (ROI) mask based on local variance."""
+        H, W = gray.shape
+        roi_mask = np.zeros((H, W), dtype=np.uint8)
+        f = gray.astype(float)
         
-        for angle in angles:
-            nx = np.cos(angle)
-            ny = np.sin(angle)
+        global_std = f.std()
+        threshold = threshold_ratio * global_std
+
+        for r in range(0, H, block):
+            for c in range(0, W, block):
+                patch = f[r:r + block, c:c + block]
+                if patch.size > 0 and patch.std() > threshold:
+                    roi_mask[r:r + block, c:c + block] = 255
+
+        morph_size = max(5, morph_size | 1)
+        se = self._get_structuring_element(morph_size, 'ellipse')
+        
+        roi_mask = self._close(roi_mask, se)
+        roi_mask = self._open(roi_mask, se)
+        
+        return roi_mask > 0
+
+
+    # =========================================================================
+    # 3. Main Pre-processing Pipeline
+    # =========================================================================
+
+    def preprocess_fingerprint(self,
+                               image,
+                               threshold: int = 124,
+                               freq: float = 0.1,
+                               n_angles: int = 16,
+                               ksize: int = 17,
+                               sigma_perp: float = 2.0,
+                               sigma_par: float = 2.5,
+                               morph_size: int = 3, 
+                               roi_block: int = 8,
+                               threshold_ratio: float = 0.2) -> np.ndarray:
+        """
+        Executes the full preprocessing pipeline: Normalization -> Gabor Enhancement 
+        -> Binarization -> ROI Masking.
+        """
+        ksize = max(5, ksize | 1) 
+        
+        gray = self._to_gray(image)
+        normalized = self.normalize(gray)
+
+        enhanced = self.gabor_enhance(normalized, n_angles=n_angles, freq=freq, 
+                                      ksize=ksize, sigma_perp=sigma_perp, sigma_par=sigma_par)
+        enhanced_u8 = (enhanced * 255).astype(np.uint8)
+
+        if morph_size > 1:
+            morph_size = max(3, morph_size | 1)
+            se = self._get_structuring_element(morph_size, 'ellipse')
+            enhanced_u8 = self._open(self._close(enhanced_u8, se), se)
+
+        binary = np.where(enhanced_u8 >= threshold, np.uint8(0), np.uint8(255))
+
+        roi_mask = self._compute_roi(normalized, block=roi_block, threshold_ratio=threshold_ratio, 
+                                     morph_size=max(15, roi_block * 4 | 1))
+        
+        binary[~roi_mask] = 255
+        return binary
+
+
+    # =========================================================================
+    # 4. Skeletonization Methods
+    # =========================================================================
+
+    def apply_kmm(self, binary: np.ndarray) -> np.ndarray:
+        """
+        Applies the KMM (Saeed, Rybnik, Tabedzki, Adamski) skeletonization algorithm 
+        to reduce ridge thickness to a single pixel.
+        """
+        _lut = np.zeros(256, dtype=bool)
+        _lut[[3, 5, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31, 48,
+              52, 53, 54, 55, 56, 60, 61, 62, 63, 65, 67, 69, 71, 77, 79, 80,
+              81, 83, 84, 85, 86, 87, 88, 89, 91, 92, 93, 94, 95, 97, 99, 101,
+              103, 109, 111, 112, 113, 115, 116, 117, 118, 119, 120, 121, 123, 124, 125, 126,
+              127, 131, 133, 135, 141, 143, 149, 151, 157, 159, 181, 183, 189, 191, 192, 193,
+              195, 197, 199, 205, 207, 208, 209, 211, 212, 213, 214, 215, 216, 217, 219, 220,
+              221, 222, 223, 224, 225, 227, 229, 231, 237, 239, 240, 241, 243, 244, 245, 246,
+              247, 248, 249, 251, 252, 253, 254, 255]] = True
+
+        _pad_kwargs = dict(mode='constant', constant_values=0)
+        _adjacent_neighbors = [[1, 3], [0, 2, 3, 4], [1, 4], [0, 1, 5, 6], 
+                               [1, 2, 6, 7], [3, 6], [3, 4, 5, 7], [4, 6]]
+        _component_lut = np.zeros(256, dtype=np.uint8)
+        
+        # Build Connected Components LUT for KMM phase B
+        for pattern in range(256):
+            bits = [i for i in range(8) if (pattern >> i) & 1]
+            if not bits: 
+                continue
             
-            p_active = active_x * nx + active_y * ny
-            
-            min_p, max_p = np.floor(p_active.min()), np.ceil(p_active.max())
-            bins = np.arange(min_p, max_p + 2)
-            hist, edges = np.histogram(p_active, bins=bins)
-            
-            max_val = np.max(hist)
-            if max_val == 0: continue
-            
-            threshold = max_val * threshold_1
-            valid_indices = np.where(hist > threshold)[0]
-            
-            if len(valid_indices) == 0: continue
+            bit_set, visited, max_size = set(bits), set(), 0
+            for start_node in bits:
+                if start_node in visited: 
+                    continue
+                queue, size = [start_node], 0
+                visited.add(start_node)
                 
-            p_min = edges[valid_indices[0]]
-            p_max = edges[valid_indices[-1] + 1]
-            
-            P_grid = x_grid * nx + y_grid * ny
-            
-            stripe_mask = (P_grid >= p_min) & (P_grid <= p_max)
-            
-            intersection_mask &= stripe_mask.astype(np.uint8)
+                while queue:
+                    node = queue.pop(0)
+                    size += 1
+                    for neighbor in _adjacent_neighbors[node]:
+                        if neighbor in bit_set and neighbor not in visited:
+                            visited.add(neighbor)
+                            queue.append(neighbor)
+                max_size = max(max_size, size)
+            _component_lut[pattern] = max_size
 
-        final_pixels = inverted & intersection_mask
-        
-        proj_y = np.sum(final_pixels, axis=1)
-        proj_x = np.sum(final_pixels, axis=0)
-        
-        def get_final_bounds(proj):
-            max_val = np.max(proj)
-            if max_val == 0: return 0, 0
-            valid_indices = np.where(proj > max_val * threshold_2)[0]
-            if len(valid_indices) == 0: return 0, 0
-            return valid_indices[0], valid_indices[-1]
-            
-        top, bottom = get_final_bounds(proj_y)
-        left, right = get_final_bounds(proj_x)
-        
-        center_y = int((top + bottom) / 2)
-        center_x = int((left + right) / 2)
-        
-        radius_y = (bottom - top) / 2
-        radius_x = (right - left) / 2
-        radius = int((radius_x + radius_y) / 2)
-        
-        return center_x, center_y, radius
+        img = (binary == 0).astype(np.uint8)
 
-    @staticmethod
-    def draw_crosshair_and_circle(img, x, y, r, cross_size=20, color=(255, 0, 0)):
-        if len(img.shape) == 2:
-            img_color = np.stack([img, img, img], axis=-1)
-        else:
-            img_color = img.copy()
-            
-        h, w = img_color.shape[:2]
-        
-        x_start = max(0, x - cross_size)
-        x_end = min(w, x + cross_size)
-        img_color[y, x_start:x_end] = color
-        
-        y_start = max(0, y - cross_size)
-        y_end = min(h, y + cross_size)
-        img_color[y_start:y_end, x] = color
-        
-        y_idx, x_idx = np.ogrid[:h, :w]
-        
-        dist_from_center_sq = (x_idx - x)**2 + (y_idx - y)**2
-        
-        ring_thickness = 2
-        ring_mask = (dist_from_center_sq <= r**2) & (dist_from_center_sq >= (max(0, r - ring_thickness))**2)
-        
-        img_color[ring_mask] = color
-        
-        return img_color
-    
-    @staticmethod
-    def find_iris_radius(gray_img, cx, cy, pupil_radius):
+        while True:
+            previous_img = img.copy()
+            p = np.pad(img, 1, **_pad_kwargs)
+
+            # Phase A: Border and corner classification
+            edges = ((p[:-2, 1:-1] == 0) | (p[2:, 1:-1] == 0) | 
+                     (p[1:-1, :-2] == 0) | (p[1:-1, 2:] == 0))
+            img[(img == 1) & edges] = 2
+
+            corners = ((p[:-2, :-2] == 0) | (p[:-2, 2:] == 0) | 
+                       (p[2:, :-2] == 0) | (p[2:, 2:] == 0))
+            img[(img == 1) & corners] = 3
+
+            # Phase B: Deletion of specific contour pixels
+            contour = (img == 2) | (img == 3)
+            pc = np.pad(contour.astype(np.uint8), 1, **_pad_kwargs)
+            pattern_b = (pc[:-2, :-2]       | pc[:-2, 1:-1] * 2  | pc[:-2, 2:] * 4 |
+                         pc[1:-1, :-2] * 8  | pc[1:-1, 2:] * 16  | pc[2:, :-2] * 32 |
+                         pc[2:, 1:-1] * 64  | pc[2:, 2:] * 128).astype(np.uint8)
+                         
+            max_component = _component_lut[pattern_b]
+            img[contour & (max_component >= 2) & (max_component <= 4)] = 0
+
+            # Phase C: Sequential deletion via LUT mapping
+            H, W = img.shape
+            for N in (2, 3):
+                for r, c in np.argwhere(img == N):
+                    w = 0
+                    if r > 0:
+                        if c > 0 and img[r-1, c-1]: w += 128
+                        if           img[r-1, c  ]: w += 1
+                        if c < W-1 and img[r-1, c+1]: w += 2
+                    if c > 0 and img[r, c-1]: w += 64
+                    if c < W-1 and img[r, c+1]: w += 4
+                    if r < H-1:
+                        if c > 0 and img[r+1, c-1]: w += 32
+                        if           img[r+1, c  ]: w += 16
+                        if c < W-1 and img[r+1, c+1]: w += 8
+                    img[r, c] = 0 if _lut[w] else 1
+
+            # Check convergence
+            if np.array_equal(img, previous_img):
+                break
+
+        return np.where(img == 1, np.uint8(0), np.uint8(255))
+
+    def skeletonize(self, binary: np.ndarray) -> np.ndarray:
         """
-        Wyznacza promień tęczówki analizując wyłącznie poziomy pas przechodzący przez środek źrenicy.
-        Ignoruje zakłócenia od powiek i rzęs z góry i z dołu.
+        Applies mathematical morphology (erosion & dilation) to compute 
+        the image skeleton (Zhang-Suen alternative).
         """
-        h, w = gray_img.shape
-        
-        # Wycinamy poziomy pasek o wysokości 20 pikseli wokół środka źrenicy
-        strip_height = 10 
-        y_start = max(0, cy - strip_height)
-        y_end = min(h, cy + strip_height)
-        
-        # Pobieramy pasek i uśredniamy go pionowo, aby uzyskać jeden stabilny ciąg wartości (1D)
-        horizontal_strip = gray_img[y_start:y_end, :]
-        profile = np.mean(horizontal_strip, axis=0)
-        
-        # Obliczamy gradient (pochodną) - czyli różnicę jasności między sąsiednimi pikselami.
-        # W miejscu przejścia ciemnej tęczówki w jasną twardówkę będzie skok.
-        gradient = np.abs(np.diff(profile))
-        
-        ignore_margin = int(pupil_radius * 1.2)
-        safe_left = max(0, cx - ignore_margin)
-        safe_right = min(w - 1, cx + ignore_margin)
-        gradient[safe_left:safe_right] = 0
-        
-        # największy skok po lewej stronie
-        left_half = gradient[:cx]
-        left_edge_x = np.argmax(left_half) if len(left_half) > 0 else 0
-        
-        # największy skok po prawej stronie
-        right_half = gradient[cx:]
-        right_edge_x = cx + np.argmax(right_half) if len(right_half) > 0 else 0
-        
-        r_left = cx - left_edge_x
-        r_right = right_edge_x - cx
-        
-        # uśredniamy wynik
-        iris_radius = int((r_left + r_right) / 2)
-        
-        # zabezpieczenie przed błędem: tęczówka nie może być poza zdjęciem
-        if iris_radius < pupil_radius:
-            iris_radius = pupil_radius + 20 # Wartość domyślna awaryjna
+        current = np.where(binary == 0, np.uint8(255), np.uint8(0))
+        current = np.pad(current, 1, mode='constant', constant_values=0)
+        se = self._get_structuring_element(3, 'cross')
+        skeleton = np.zeros_like(current)
+
+        while current.max() > 0:
+            eroded = self._erode(current, se)
+            opened = self._dilate(eroded, se)
+            residual = np.clip(current.astype(np.int16) - opened.astype(np.int16), 0, 255).astype(np.uint8)
+            skeleton = np.maximum(skeleton, residual)
+            current = eroded
+
+        skeleton = skeleton[1:-1, 1:-1]
+        return np.where(skeleton > 0, np.uint8(0), np.uint8(255))
+
+
+    # =========================================================================
+    # 5. Minutiae Detection & Visualization
+    # =========================================================================
+
+    def detect_minutiae(self, skeleton: np.ndarray, margin: int = 12) -> dict:
+        """
+        Detects ridge endings and bifurcations using the Crossing Number method.
+        """
+        s = (skeleton == 0).astype(np.int16)
+        H, W = s.shape
+        p = np.pad(s, 1, mode='constant', constant_values=0)
+
+        # 8 neighbors collected in clockwise order
+        neighbors = np.stack([
+            p[:-2, :-2], p[:-2, 1:-1], p[:-2, 2:], p[1:-1, 2:],
+            p[2:, 2:], p[2:, 1:-1], p[2:, :-2], p[1:-1, :-2]
+        ], axis=0)
+
+        diff_sum = np.zeros((H, W), dtype=np.int16)
+        for k in range(8):
+            diff_sum += np.abs(neighbors[k] - neighbors[(k + 1) % 8])
             
-        return iris_radius
+        cn = (diff_sum // 2).astype(np.uint8)
 
-    @staticmethod
-    def unwrap_iris(image, cx, cy, r_pupil, r_iris, width=128, height=64):
+        mask = np.zeros((H, W), dtype=bool)
+        mask[margin:H - margin, margin:W - margin] = True
+        mask &= (s == 1)
+
+        terminations = [tuple(pt) for pt in np.argwhere(mask & (cn == 1))]
+        bifurcations = [tuple(pt) for pt in np.argwhere(mask & (cn == 3))]
+
+        return {'terminations': terminations, 'bifurcations': bifurcations}
+
+    def draw_minutiae(self, skeleton: np.ndarray, minutiae: dict, radius: int = 4) -> np.ndarray:
         """
-        Przekształca pierścień tęczówki w prostokąt (normalizacja Daugmana).
-        Zgodnie z literaturą pomija obszary z góry i dołu (powieki/rzęsy),
-        pobierając wyłącznie bezpieczne wycinki z lewej i prawej strony.
+        Overlays the detected minutiae onto the skeleton image in RGB format.
+        Terminations = Red, Bifurcations = Blue.
         """
-        if len(image.shape) == 3:
-            unwrapped = np.zeros((height, width, 3), dtype=np.uint8)
-        else:
-            unwrapped = np.zeros((height, width), dtype=np.uint8)
+        rgb_image = np.stack([skeleton, skeleton, skeleton], axis=-1).copy()
+        H, W = skeleton.shape
+        Y, X = np.ogrid[:H, :W]
 
-        # Prawa strona oka: od -45 stopni (-pi/4) do 45 stopni (pi/4)
-        # Lewa strona oka: od 135 stopni (3*pi/4) do 225 stopni (5*pi/4)
-        half_w = width // 2
-        theta_right = np.linspace(-np.pi / 4, np.pi / 4, half_w)
-        theta_left = np.linspace(3 * np.pi / 4, 5 * np.pi / 4, width - half_w)
-        
-        thetas = np.concatenate([theta_right, theta_left])
-        rhos = np.linspace(0, 1, height)
+        def _circle(center, r):
+            cy, cx = center
+            return (Y - cy) ** 2 + (X - cx) ** 2 <= r ** 2
 
-        theta_grid, rho_grid = np.meshgrid(thetas, rhos)
+        for pt in minutiae.get('terminations', []):
+            m = _circle(pt, radius)
+            rgb_image[m, 0], rgb_image[m, 1], rgb_image[m, 2] = 255, 0, 0
 
-        r_grid = r_pupil + rho_grid * (r_iris - r_pupil)
+        for pt in minutiae.get('bifurcations', []):
+            m = _circle(pt, radius)
+            rgb_image[m, 0], rgb_image[m, 1], rgb_image[m, 2] = 0, 0, 255
 
-        x_grid = cx + r_grid * np.cos(theta_grid)
-        y_grid = cy + r_grid * np.sin(theta_grid)
-
-        x_grid = np.clip(np.round(x_grid), 0, image.shape[1] - 1).astype(int)
-        y_grid = np.clip(np.round(y_grid), 0, image.shape[0] - 1).astype(int)
-
-        unwrapped = image[y_grid, x_grid]
-        
-        return unwrapped
-    
-    @staticmethod
-    def generate_iris_code(unwrapped_img, f=0.1, n_bands=8, n_points=128):
-        """
-        Wyznacza 2048-bitowy kod tęczówki za pomocą algorytmu Daugmana.
-        Oczekuje na wejściu znormalizowanego obrazu (np. 64x128 pikseli).
-        """
-        if len(unwrapped_img.shape) == 3:
-            gray = np.dot(unwrapped_img[...,:3], [0.299, 0.587, 0.114])
-        else:
-            gray = unwrapped_img.astype(float)
-
-        h, w = gray.shape
-        band_h = h // n_bands  
-
-        sigma = 0.5 * np.pi * f
-        
-        x = np.arange(-n_points // 2, n_points // 2)
-        
-        gabor_real = np.exp(-(x**2) / (sigma**2)) * np.cos(2 * np.pi * f * x)
-        gabor_imag = np.exp(-(x**2) / (sigma**2)) * (-np.sin(2 * np.pi * f * x))
-
-        y = np.arange(band_h)
-        center_y = (band_h - 1) / 2.0
-        sigma_y = band_h / 4.0 
-        
-        gauss_window = np.exp(-((y - center_y)**2) / (2 * sigma_y**2))
-        gauss_window /= np.sum(gauss_window) 
-
-        iris_code_bits = []
-
-        for i in range(n_bands):
-            band = gray[i * band_h : (i + 1) * band_h, :]
-            
-            if w != n_points:
-                indices = np.linspace(0, w - 1, n_points).astype(int)
-                band_sampled = band[:, indices]
-            else:
-                band_sampled = band
-
-            signal_1d = np.dot(band_sampled.T, gauss_window)
-            
-            # Usuwamy składową stałą, by sygnał wahał się wokół zera!
-            signal_1d = signal_1d - np.mean(signal_1d)
-
-            # mieniamy z mode='wrap' na mode='reflect', bo mamy ucięte boki i zszyte na środku.
-            pad_w = len(gabor_real) // 2
-            sig_padded = np.pad(signal_1d, pad_w, mode='reflect')
-
-            # Używamy mode='valid', aby pozbyć się dodanego paddingu
-            res_real = np.convolve(sig_padded, gabor_real, mode='valid')
-            res_imag = np.convolve(sig_padded, gabor_imag, mode='valid')
-
-            # Wyrównanie długości
-            res_real = res_real[:n_points]
-            res_imag = res_imag[:n_points]
-
-            bit1 = (res_imag < 0).astype(np.uint8)
-            bit2 = (res_real < 0).astype(np.uint8)
-
-            iris_code_bits.append(bit1)
-            iris_code_bits.append(bit2)
-
-        return np.array(iris_code_bits, dtype=np.uint8)
-
-    @staticmethod
-    def visualize_iris_code(code_array):
-        """Tworzy czarno-biały obrazek kodu dla UI."""
-        return (code_array * 255).astype(np.uint8)
-    
-    @staticmethod
-    def calculate_hamming_distance(code1, code2):
-        """
-        Oblicza odległość Hamminga zgodnie z literaturą.
-        d = (1/N) * suma(C_i XOR C'_i)
-        """
-        b1 = (code1 > 128).astype(np.uint8)
-        b2 = (code2 > 128).astype(np.uint8)
-        
-        h = min(b1.shape[0], b2.shape[0])
-        w = min(b1.shape[1], b2.shape[1])
-        b1 = b1[:h, :w]
-        b2 = b2[:h, :w]
-        
-        diff = np.bitwise_xor(b1, b2)
-        
-        distance = np.sum(diff) / diff.size
-        return distance
+        return rgb_image.astype(np.uint8)

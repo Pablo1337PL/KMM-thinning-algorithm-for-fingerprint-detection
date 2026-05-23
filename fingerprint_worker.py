@@ -1,9 +1,10 @@
 import numpy as np
+from PIL import Image
 from PyQt5.QtCore import QThread, pyqtSignal
 
-from fingerprint_processor import IrisProcessor
+from fingerprint_processor import FingerprintProcessor
 
-class IrisWorker(QThread):
+class FingerprintWorker(QThread):
     finished = pyqtSignal(object)
 
     def __init__(self, image, step, params):
@@ -12,85 +13,113 @@ class IrisWorker(QThread):
         self.step = step
         self.params = params
         self.is_cancelled = False
+        self.proc = FingerprintProcessor()
 
     def run(self):
         img = self.image.copy()
 
-        if self.step == 0:
-            pass
-        elif self.step >= 1:
-            img = IrisProcessor.to_grayscale(img)
-            P = IrisProcessor.calculate_base_threshold(img)
-            
-            if self.step >= 2:
-                x_param = self.params.get('x_param', 1.0)
-                if x_param <= 0: x_param = 0.1 
-                threshold_I = P / x_param
-                img = np.where(img < threshold_I, 0, 255).astype(np.uint8)
-
-                if self.step >= 3:
-                    op1 = self.params.get('op1', 'Brak')
-                    sz1 = self.params.get('sz1', 3)
-                    img = IrisProcessor.apply_morphology(img, op1, sz1)
+        try:
+            if self.step == 0:
+                pass  # Oryginał
+            elif self.step >= 1:
+                # Krok 1: Skala szarości
+                pil_img = Image.fromarray(img)
+                img = self.proc._to_gray(pil_img)
+                
+                if self.step >= 2:
+                    # Krok 2: Normalizacja
+                    img = self.proc.normalize(img)
                     
-                    op2 = self.params.get('op2', 'Brak')
-                    sz2 = self.params.get('sz2', 3)
-                    img = IrisProcessor.apply_morphology(img, op2, sz2)
-
-                    if self.step >= 4:
-                        # cx, cy = IrisProcessor.find_center_via_projections(img)
-                        # img = IrisProcessor.draw_crosshair(img, cx, cy, size=30, color=(255, 0, 0))
-
-                        cx, cy, pupil_radius = IrisProcessor.find_center_and_radius_via_n_projections(img)
-                        img_cross = IrisProcessor.draw_crosshair_and_circle(img, cx, cy, pupil_radius, cross_size=30, color=(255, 0, 0))
+                    if self.step >= 3:
+                        # Krok 3: Segmentacja (Maska ROI)
+                        roi_block = self.params.get('roi_block', 8)
+                        t_ratio = self.params.get('threshold_ratio', 0.2) 
                         
-                        if self.step == 4:
-                            img = img_cross
-
-                        if self.step >= 5:
-                            img_gray = IrisProcessor.to_grayscale(self.image.copy())
-                            x_param_iris = self.params.get('x_param_iris', 1.0)
-                            if x_param_iris <= 0: x_param_iris = 0.1 
-                            threshold_P = P / x_param_iris
+                        maska = self.proc._compute_roi(img, block=roi_block, 
+                                                       threshold_ratio=t_ratio, 
+                                                       morph_size=max(15, roi_block * 4 | 1))
+                        
+                        if self.step == 3:
+                            # WIZUALIZACJA: Nałożenie maski na znormalizowany obraz
+                            # Kopiujemy obraz i wszystkie piksele poza maską (~maska) ustawiamy na 0 (czarny)
+                            wizualizacja_roi = img.copy()
+                            wizualizacja_roi[~maska] = 0
+                            img = wizualizacja_roi
+                                
+                        if self.step >= 4:
+                            # Krok 4: Mapa Orientacji
+                            ori = self.proc._estimate_orientation(img)
                             
-                            img_iris_bin = np.where(img_gray < threshold_P, 0, 255).astype(np.uint8)
-                            if self.step == 5:
-                                img = img_iris_bin
-
-                            if self.step >= 6:
-                                op3 = self.params.get('op3', 'Brak')
-                                sz3 = self.params.get('sz3', 3)
-                                img_iris_bin = IrisProcessor.apply_morphology(img_iris_bin, op3, sz3)
+                            if self.step == 4:
+                                # Wizualizacja mapy orientacji (przeskalowana do skali szarości)
+                                img = (ori / np.pi * 255).astype(np.uint8)
                                 
-                                op4 = self.params.get('op4', 'Brak')
-                                sz4 = self.params.get('sz4', 3)
-                                img_iris_bin = IrisProcessor.apply_morphology(img_iris_bin, op4, sz4)
-
-                                if self.step == 6:
-                                    img = img_iris_bin
+                            if self.step >= 5:
+                                # Krok 5: Filtracja Gabora
+                                freq = self.params.get('freq', 0.1)
+                                n_angles = self.params.get('n_angles', 16)
+                                ksize = self.params.get('ksize', 17)
+                                ksize = max(5, ksize | 1) # Wymuszenie nieparzystości
+                                sigma_perp = self.params.get('sigma_perp', 2.0)
+                                sigma_par = self.params.get('sigma_par', 2.5)
                                 
+                                gabor_img = self.proc.gabor_enhance(img, n_angles=n_angles, freq=freq, 
+                                                                    ksize=ksize, sigma_perp=sigma_perp, sigma_par=sigma_par)
                                 
-                                if self.step >= 7:
-                                    iris_radius = IrisProcessor.find_iris_radius(img_iris_bin, cx, cy, pupil_radius)
+                                if self.step == 5:
+                                    # Wizualizacja wyniku Gabora
+                                    img = (gabor_img * 255).astype(np.uint8)
                                     
-                                    if self.step == 7:
-                                        color_display = self.image.copy()
-                                        color_display = IrisProcessor.draw_crosshair_and_circle(color_display, cx, cy, pupil_radius, color=(255, 0, 0))
-                                        color_display = IrisProcessor.draw_crosshair_and_circle(color_display, cx, cy, iris_radius, color=(0, 255, 0))
-                                        img = color_display
-
+                                if self.step >= 6:
+                                    # Krok 6: Binaryzacja progowa z nałożeniem maski
+                                    threshold = self.params.get('threshold', 124)
+                                    wzmU8 = (gabor_img * 255).astype(np.uint8)
                                     
-                                    if self.step >= 8:
-                                        unwrapped = IrisProcessor.unwrap_iris(
-                                            self.image, cx, cy, pupil_radius, iris_radius, width=360, height=60
-                                        )
-                                        if self.step == 8:
-                                            img = unwrapped
+                                    # Opcjonalne morfologiczne czyszczenie szumu przed binaryzacją
+                                    morph_size = self.params.get('morph_size', 3)
+                                    if morph_size > 1:
+                                        se = self.proc._get_structuring_element(morph_size, 'ellipse')
+                                        wzmU8 = self.proc._open(self.proc._close(wzmU8, se), se)
+
+                                    bin_img = np.where(wzmU8 >= threshold, np.uint8(0), np.uint8(255))
+                                    bin_img[~maska] = 255 # Wyczyszczenie tła poza maską
+                                    
+                                    if self.step == 6:
+                                        img = bin_img
                                         
-                                        if self.step >= 9:
-                                            f_val = self.params.get('f_frequency', 0.5)
+                                    if self.step >= 7:
+                                        # Krok 7: Szkieletyzacja (Porównanie KMM vs Morfologiczna)
+                                        szkielet_kmm = self.proc.apply_kmm(bin_img.copy())
+                                        szkielet_morf = self.proc.skeletonize(bin_img.copy())
+                                        
+                                        # Tworzymy czarny pasek oddzielający (5 pikseli szerokości)
+                                        H = szkielet_kmm.shape[0]
+                                        separator_2d = np.zeros((H, 5), dtype=np.uint8) 
+                                        
+                                        if self.step == 7:
+                                            # Łączymy obrazy poziomo (KMM po lewej, Morfologiczna po prawej)
+                                            img = np.hstack((szkielet_kmm, separator_2d, szkielet_morf))
                                             
-                                            code = IrisProcessor.generate_iris_code(unwrapped, f=f_val)
-                                            img = IrisProcessor.visualize_iris_code(code)
-        if not self.is_cancelled:
-            self.finished.emit(img)
+                                        if self.step >= 8:
+                                            # Krok 8: Detekcja minucji dla OBU szkieletów
+                                            minucje_kmm = self.proc.detect_minutiae(szkielet_kmm)
+                                            img_min_kmm = self.proc.draw_minutiae(szkielet_kmm, minucje_kmm)
+                                            
+                                            minucje_morf = self.proc.detect_minutiae(szkielet_morf)
+                                            img_min_morf = self.proc.draw_minutiae(szkielet_morf, minucje_morf)
+                                            
+                                            if self.step == 8:
+                                                # Tworzymy kolorowy (RGB) pasek oddzielający
+                                                separator_3d = np.zeros((H, 5, 3), dtype=np.uint8)
+                                                # Łączymy pokolorowane obrazy poziomo
+                                                img = np.hstack((img_min_kmm, separator_3d, img_min_morf))
+
+            # Zabezpieczenie przed typami float
+            if type(img) is np.ndarray and img.dtype == np.float64:
+                 img = img.astype(np.uint8)
+
+            if not self.is_cancelled:
+                self.finished.emit(img)
+                
+        except Exception as e:
+            print(f"Błąd w wątku przetwarzania: {e}")
