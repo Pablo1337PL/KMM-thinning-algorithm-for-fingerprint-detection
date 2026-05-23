@@ -432,7 +432,52 @@ class FingerprintProcessor:
         return {'terminations': valid_terminations, 'bifurcations': bifurcations}
 
 
-    def draw_minutiae(self, skeleton: np.ndarray, minutiae: dict, radius: int = 4) -> np.ndarray:
+    def draw_minutiae(self, skeleton: np.ndarray, minutiae: dict, radius: int = 5) -> np.ndarray:
+        """
+        Overlays the detected minutiae onto the skeleton image in RGB format.
+        Colors ONLY the skeleton lines within a certain radius of the minutiae points.
+        Terminations = Red lines, Bifurcations = Blue lines.
+        """
+        # Convert grayscale skeleton (0=ridge, 255=bg) to a 3-channel RGB image
+        rgb_image = np.stack([skeleton, skeleton, skeleton], axis=-1).copy()
+        H, W = skeleton.shape
+        Y, X = np.ogrid[:H, :W]
+
+        # Helper function to create a circular mask
+        def _circle(center, r):
+            cy, cx = center
+            return (Y - cy) ** 2 + (X - cx) ** 2 <= r ** 2
+
+        # Create a boolean mask of the skeleton itself (where the ridges are black/0)
+        skeleton_mask = (skeleton == 0)
+
+        # 1. Color the terminations (Ridge Endings) -> RED
+        for pt in minutiae.get('terminations', []):
+            circle_mask = _circle(pt, radius)
+            # Combine the circle area with the actual skeleton pixels
+            line_mask = circle_mask & skeleton_mask
+            
+            # Apply Red color (R=255, G=0, B=0) to the black pixels
+            rgb_image[line_mask, 0] = 255
+            rgb_image[line_mask, 1] = 0
+            rgb_image[line_mask, 2] = 0
+
+        # 2. Color the bifurcations -> BLUE
+        for pt in minutiae.get('bifurcations', []):
+            circle_mask = _circle(pt, radius)
+            # Combine the circle area with the actual skeleton pixels
+            line_mask = circle_mask & skeleton_mask
+            
+            # Apply Blue color (R=0, G=0, B=255) to the black pixels
+            rgb_image[line_mask, 0] = 0
+            rgb_image[line_mask, 1] = 0
+            rgb_image[line_mask, 2] = 255
+
+        return rgb_image.astype(np.uint8)
+
+
+    # old method for drawing - makes circles
+    def __draw_minutiae(self, skeleton: np.ndarray, minutiae: dict, radius: int = 4) -> np.ndarray:
         """
         Overlays the detected minutiae onto the skeleton image in RGB format.
         Terminations = Red, Bifurcations = Blue.

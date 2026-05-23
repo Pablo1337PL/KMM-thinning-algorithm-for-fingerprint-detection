@@ -152,7 +152,7 @@ class MainWindow(QMainWindow):
             "Krok 5: Filtr Gabora",
             "Krok 6: Binaryzacja",
             "Krok 7: Szkieletyzacja (LEWO: KMM | PRAWO: Morfologiczna)",
-            "Krok 8: Detekcja Minucji (LEWO: KMM | PRAWO: Morfologiczna)"
+            "Krok 8: Detekcja Minucji (LEWO: KMM | PRAWO: Morfologiczna) ■ Czerwony: Zakończenie | ■ Niebieski: Bifurkacja"
         ]
         
         if self.current_step < len(tytuly_krokow):
