@@ -133,24 +133,31 @@ class FingerprintProcessor:
         )
         return np.clip(norm, 0, 255).astype(np.uint8)
 
-    def _estimate_orientation(self, gray: np.ndarray, block: int = 16) -> np.ndarray:
-        """Estimates the local ridge orientation map of the fingerprint."""
+
+    def _get_orientation_map(self, norm: np.ndarray, block: int = 16, smooth_iter: int = 2) -> np.ndarray:
+        f  = norm.astype(np.float64)
         Kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], float)
-        gx = self._convolve2d(gray.astype(float), Kx)
-        gy = self._convolve2d(gray.astype(float), Kx.T)
-        
+        gx = self._convolve2d(f, Kx)
+        gy = self._convolve2d(f, Kx.T)
+
         Vx = 2.0 * gx * gy
         Vy = gx ** 2 - gy ** 2
-        H, W = gray.shape
-        orientation = np.zeros((H, W), float)
-        
+
+        H, W = f.shape
+        bVx  = np.zeros((H, W))
+        bVy  = np.zeros((H, W))
+
         for r in range(0, H, block):
             for c in range(0, W, block):
-                bvx = Vx[r:r + block, c:c + block].mean()
-                bvy = Vy[r:r + block, c:c + block].mean()
-                orientation[r:r + block, c:c + block] = 0.5 * np.arctan2(bvx, bvy) + np.pi / 2.0
-                
-        return orientation
+                bVx[r:r + block, c:c + block] = Vx[r:r + block, c:c + block].mean()
+                bVy[r:r + block, c:c + block] = Vy[r:r + block, c:c + block].mean()
+
+        for _ in range(smooth_iter):
+            bVx = self._convolve2d(bVx, np.ones((block, block), float) / (block * block))
+            bVy = self._convolve2d(bVy, np.ones((block, block), float) / (block * block))
+
+        return 0.5 * np.arctan2(bVx, bVy) + np.pi / 2.0
+
 
     def _gabor_kernel(self, size: int, theta: float, freq: float, sigma_perp: float, sigma_par: float) -> np.ndarray:
         """Generates a directional Gabor kernel based on spatial frequency and orientation."""
@@ -175,7 +182,7 @@ class FingerprintProcessor:
         kernels = [self._gabor_kernel(ksize, t, freq, sigma_perp, sigma_par) for t in angles]
         resps = np.stack([self._convolve2d(f, k) for k in kernels])
 
-        orientation = self._estimate_orientation(gray)
+        orientation = self._get_orientation_map(gray)
         idx = np.round((orientation % np.pi) / np.pi * n_angles).astype(int) % n_angles
 
         rows = np.arange(gray.shape[0])[:, None]

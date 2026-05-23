@@ -48,7 +48,7 @@ class FingerprintWorker(QThread):
                                 
                         if self.step >= 4:
                             # Krok 4: Mapa Orientacji
-                            ori = self.proc._estimate_orientation(img)
+                            ori = self.proc._get_orientation_map(img)
                             
                             if self.step == 4:
                                 # Wizualizacja mapy orientacji (przeskalowana do skali szarości)
@@ -71,22 +71,31 @@ class FingerprintWorker(QThread):
                                     img = (gabor_img * 255).astype(np.uint8)
                                     
                                 if self.step >= 6:
-                                    # Krok 6: Binaryzacja progowa z nałożeniem maski
+                                    # # Krok 6: Binaryzacja progowa z nałożeniem maski
                                     threshold = self.params.get('threshold', 124)
                                     wzmU8 = (gabor_img * 255).astype(np.uint8)
                                     
-                                    # Opcjonalne morfologiczne czyszczenie szumu przed binaryzacją
+                                    # # Opcjonalne morfologiczne czyszczenie szumu przed binaryzacją
+                                    # morph_size = self.params.get('morph_size', 3)
+                                    # if morph_size > 1:
+                                    #     se = self.proc._get_structuring_element(morph_size, 'ellipse')
+                                    #     wzmU8 = self.proc._open(self.proc._close(wzmU8, se), se)
+
+                                    # bin_img = np.where(wzmU8 >= threshold, np.uint8(0), np.uint8(255))
+                                    
+                                    bin_img = np.where(wzmU8 >= threshold, np.uint8(0), np.uint8(255))
                                     morph_size = self.params.get('morph_size', 3)
                                     if morph_size > 1:
+                                        # Wymuszenie liczby nieparzystej i całkowitej
+                                        morph_size = max(3, int(morph_size) | 1)
                                         se = self.proc._get_structuring_element(morph_size, 'ellipse')
-                                        wzmU8 = self.proc._open(self.proc._close(wzmU8, se), se)
+                                        bin_img = self.proc._open(self.proc._close(bin_img, se), se)
 
-                                    bin_img = np.where(wzmU8 >= threshold, np.uint8(0), np.uint8(255))
                                     bin_img[~maska] = 255 # Wyczyszczenie tła poza maską
                                     
                                     if self.step == 6:
                                         img = bin_img
-                                        
+
                                     if self.step >= 7:
                                         # Krok 7: Szkieletyzacja (Porównanie KMM vs Morfologiczna)
                                         szkielet_kmm = self.proc.apply_kmm(bin_img.copy())
