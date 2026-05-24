@@ -40,7 +40,7 @@ class SaveWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Segmentacja tęczówki")
+        self.setWindowTitle("Analiza odcisków palców")
         self.current_step = 0
         self.original_image = None
         self.current_processed_image = None
@@ -139,9 +139,17 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self.on_process_finished)
         self.worker.start()
 
-    def on_process_finished(self, processed_img):
-        self.current_processed_image = processed_img
-        self.viewer.wyswietl_obraz_numpy(processed_img)
+    def on_process_finished(self, result):
+        # Sprawdzamy, czy worker przysłał sam obraz (Kroki 1-9) czy obraz ze statystykami (Krok 10)
+        if isinstance(result, tuple):
+            processed_img, stats_text = result
+            self.current_processed_image = processed_img
+            self.viewer.wyswietl_obraz_numpy(processed_img)
+            # Wyświetlamy okienko informacyjne
+            QMessageBox.information(self, "Statystyki Algorytmów", stats_text)
+        else:
+            self.current_processed_image = result
+            self.viewer.wyswietl_obraz_numpy(result)
         
         tytuly_krokow = [
             "Krok 0: Oryginał", 
@@ -152,7 +160,9 @@ class MainWindow(QMainWindow):
             "Krok 5: Filtr Gabora",
             "Krok 6: Binaryzacja",
             "Krok 7: Szkieletyzacja (LEWO: KMM | PRAWO: Morfologiczna)",
-            "Krok 8: Detekcja Minucji (LEWO: KMM | PRAWO: Morfologiczna) ■ Czerwony: Zakończenie | ■ Niebieski: Bifurkacja"
+            "Krok 8: Łączenie przerwanych linii",
+            "Krok 9: Detekcja Minucji (Zakończenia | Bifurkacje)",
+            "Krok 10: Podsumowanie Wyników (Statystyki)"
         ]
         
         if self.current_step < len(tytuly_krokow):
@@ -160,9 +170,9 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_step.setText(f"Krok {self.current_step}")
         
-        # Aktywacja przycisków
+        # Aktywacja przycisków - zwiększyliśmy limit kroków do 10!
         self.btn_prev.setEnabled(self.current_step > 0)
-        self.btn_next.setEnabled(self.current_step < 8) # 8 - ilość kroków
+        self.btn_next.setEnabled(self.current_step < 10)
     
     
     def on_save_success(self, save_path):

@@ -211,11 +211,24 @@ class FingerprintProcessor:
         morph_size = max(5, morph_size | 1)
         se = self._get_structuring_element(morph_size, 'ellipse')
         
+        # Wygładzenie maski
         roi_mask = self._close(roi_mask, se)
         roi_mask = self._open(roi_mask, se)
         
+        # 1. Delikatne skurczenie maski, aby nie łapała szumu wokół odcisku
+        se_margin = self._get_structuring_element(21, 'ellipse')
+        roi_mask = self._erode(roi_mask, se_margin)
+        
+        # 2. BEZWZGLĘDNE OBCIĘCIE RAMEK (artefaktów brzegowych)
+        # Wycinamy 15 pikseli z absolutnie każdej krawędzi obrazu
+        margin = 15
+        if H > margin * 2 and W > margin * 2:
+            roi_mask[:margin, :] = 0    # Usuń z góry
+            roi_mask[-margin:, :] = 0   # Usuń z dołu
+            roi_mask[:, :margin] = 0    # Usuń z lewej
+            roi_mask[:, -margin:] = 0   # Usuń z prawej
+        
         return roi_mask > 0
-
 
     # =========================================================================
     # 3. Main Pre-processing Pipeline
@@ -234,7 +247,7 @@ class FingerprintProcessor:
                                threshold_ratio: float = 0.2) -> np.ndarray:
         """
         Executes the full preprocessing pipeline: Normalization -> Gabor Enhancement 
-        -> Binarization -> ROI Masking.
+        -> Binarization -> Morphological Smoothing -> ROI Masking.
         """
         ksize = max(5, ksize | 1) 
         
@@ -245,19 +258,21 @@ class FingerprintProcessor:
                                       ksize=ksize, sigma_perp=sigma_perp, sigma_par=sigma_par)
         enhanced_u8 = (enhanced * 255).astype(np.uint8)
 
-        if morph_size > 1:
-            morph_size = max(3, morph_size | 1)
-            se = self._get_structuring_element(morph_size, 'ellipse')
-            enhanced_u8 = self._open(self._close(enhanced_u8, se), se)
-
+        # 1. Najpierw binaryzujemy
         binary = np.where(enhanced_u8 >= threshold, np.uint8(0), np.uint8(255))
 
+        # 2. Potem wygładzamy czarno-biały obraz (TAK SAMO JAK W WORKERZE)
+        if morph_size > 1:
+            morph_size = max(3, int(morph_size) | 1)
+            se = self._get_structuring_element(morph_size, 'ellipse')
+            binary = self._open(self._close(binary, se), se)
+
+        # 3. Na koniec nakładamy maskę i czyścimy tło
         roi_mask = self._compute_roi(normalized, block=roi_block, threshold_ratio=threshold_ratio, 
                                      morph_size=max(15, roi_block * 4 | 1))
         
         binary[~roi_mask] = 255
         return binary
-
 
     # =========================================================================
     # 4. Skeletonization Methods
@@ -336,13 +351,142 @@ class FingerprintProcessor:
 
         skeleton = skeleton[1:-1, 1:-1]
         return np.where(skeleton > 0, np.uint8(0), np.uint8(255))
+    
+    def _draw_line(self, img: np.ndarray, pt1: tuple, pt2: tuple) -> None:
+        """
+        Rysuje linię w tablicy numpy za pomocą algorytmu Bresenhama.
+        Wymaga podania punktów w formacie (Y, X).
+        """
+        y1, x1 = pt1
+        y2, x2 = pt2
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1
+        sy = 1 if y1 < y2 else -1
+        err = dx - dy
+
+        while True:
+            if 0 <= y1 < img.shape[0] and 0 <= x1 < img.shape[1]:
+                img[y1, x1] = 0  # 0 to kolor grzbietu linii papilarnej
+            if x1 == x2 and y1 == y2:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x1 += sx
+            if e2 < dx:
+                err += dx
+                y1 += sy
+
+    def _is_path_clear(self, img: np.ndarray, pt1: tuple, pt2: tuple) -> bool:
+        """Radar sprawdzający, czy droga jest wolna (brak innych linii po drodze)"""
+        y1, x1 = pt1; y2, x2 = pt2
+        dx, dy = abs(x2 - x1), abs(y2 - y1)
+        sx = 1 if x1 < x2 else -1; sy = 1 if y1 < y2 else -1
+        err = dx - dy
+        max_steps = max(dx, dy); steps = 0
+
+        while True:
+            if x1 == x2 and y1 == y2: break
+            if 2 < steps < max_steps - 2:
+                if 0 <= y1 < img.shape[0] and 0 <= x1 < img.shape[1]:
+                    if img[y1, x1] == 0: return False # Kolizja! Przerywamy łączenie
+            e2 = 2 * err
+            if e2 > -dy: err -= dy; x1 += sx
+            if e2 < dx: err += dx; y1 += sy
+            steps += 1
+        return True
+
+    def connect_broken_lines(self, skeleton: np.ndarray, max_dist: float = 15.0, max_angle_diff: float = 45.0) -> np.ndarray:
+        """
+        Łączy przerwane linie w szkielecie. Szuka zakończeń, sprawdza ich 
+        wzajemną odległość i kąt nachylenia, a następnie rysuje brakujący fragment.
+        """
+        out_skel = skeleton.copy()
+        
+        # Pobieramy punkty zakończeń
+        minutiae = self.detect_minutiae(out_skel)
+        terminations = minutiae.get('terminations', [])
+        
+        def get_direction(y, x):
+            for dy in [-1, 0, 1]:
+                for dx in [-1, 0, 1]:
+                    if dy == 0 and dx == 0: continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < out_skel.shape[0] and 0 <= nx < out_skel.shape[1]:
+                        if out_skel[ny, nx] == 0:
+                            return np.arctan2(y - ny, x - nx)
+            return None
+
+        terms_info = [{'pt': t, 'angle': get_direction(t[0], t[1])} for t in terminations if get_direction(t[0], t[1]) is not None]
+        connected = set()
+        
+        for i, t1 in enumerate(terms_info):
+            if i in connected: continue
+            best_j = -1; min_dist_found = max_dist
+            
+            for j, t2 in enumerate(terms_info):
+                if i == j or j in connected: continue
+                dist = np.sqrt((t1['pt'][0] - t2['pt'][0])**2 + (t1['pt'][1] - t2['pt'][1])**2)
+                
+                if dist < min_dist_found:
+                    angle_between = np.arctan2(t2['pt'][0] - t1['pt'][0], t2['pt'][1] - t1['pt'][1])
+                    diff1 = min(abs(t1['angle'] - angle_between), 2*np.pi - abs(t1['angle'] - angle_between))
+                    
+                    angle_between_inv = np.arctan2(t1['pt'][0] - t2['pt'][0], t1['pt'][1] - t2['pt'][1])
+                    diff2 = min(abs(t2['angle'] - angle_between_inv), 2*np.pi - abs(t2['angle'] - angle_between_inv))
+                    
+                    if np.degrees(diff1) < max_angle_diff and np.degrees(diff2) < max_angle_diff:
+                        # TUTAJ ZABEZPIECZENIE ANTYKOLIZYJNE
+                        if self._is_path_clear(out_skel, t1['pt'], t2['pt']):
+                            min_dist_found = dist
+                            best_j = j
+            
+            if best_j != -1:
+                self._draw_line(out_skel, t1['pt'], terms_info[best_j]['pt'])
+                connected.add(i); connected.add(best_j)
+                
+        return out_skel
+
+    def prune_skeleton(self, skeleton: np.ndarray, num_iter: int = 1) -> np.ndarray:
+        """
+        Usuwa TYLKO mikroskopijne kropki (islands), zostawiając 'włoski' (spurs) nienaruszone.
+        """
+        skel = skeleton.copy()
+        
+        for _ in range(num_iter):
+            s = (skel == 0).astype(np.int16)
+            p = np.pad(s, 1, mode='constant', constant_values=0)
+            
+            # Zbieramy 8 sąsiadów w kolejności wskazówek zegara
+            neighbors = np.stack([
+                p[:-2, :-2], p[:-2, 1:-1], p[:-2, 2:], p[1:-1, 2:],
+                p[2:, 2:], p[2:, 1:-1], p[2:, :-2], p[1:-1, :-2]
+            ], axis=0)
+            
+            diff_sum = np.zeros(skel.shape, dtype=np.int16)
+            for k in range(8):
+                diff_sum += np.abs(neighbors[k] - neighbors[(k + 1) % 8])
+                
+            # Crossing Number (liczba przecięć)
+            cn = (diff_sum // 2).astype(np.uint8)
+            
+            # Szukamy punktów, które są krawędziami szkieletu (s==1)
+            # cn == 1 to zakończenie (czubek włosa) - TERAZ JE ZOSTAWIA
+            # cn == 0 to samotna kropka - TYLKO TO USUWA
+            to_delete = (s == 1) & (cn == 0)
+            
+            # Usuwamy znalezione punkty (255 to u nas kolor tła)
+            skel[to_delete] = 255
+            
+        return skel
 
 
     # =========================================================================
     # 5. Minutiae Detection & Visualization
     # =========================================================================
 
-    def detect_minutiae(self, skeleton: np.ndarray, margin: int = 12) -> dict:
+    def old_detect_minutiae(self, skeleton: np.ndarray, margin: int = 12) -> dict:
         """
         Detects ridge endings and bifurcations using the Crossing Number method.
         """
@@ -377,12 +521,7 @@ class FingerprintProcessor:
 
     # better detection ??? less false positives from broken lines
     # added __ so we dont have 2 methods with the same name
-    def __detect_minutiae(self, skeleton: np.ndarray, margin: int = 12, spurious_dist: float = 5.0) -> dict:
-        """
-        Detects ridge endings and bifurcations using the Crossing Number method,
-        with an added post-processing step to remove spurious/false minutiae 
-        caused by broken ridges.
-        """
+    def detect_minutiae(self, skeleton: np.ndarray, margin: int = 12, spurious_dist: float = 5.0, roi_mask: np.ndarray = None) -> dict:
         import math
         
         s = (skeleton == 0).astype(np.int16)
@@ -401,9 +540,22 @@ class FingerprintProcessor:
             
         cn = (diff_sum // 2).astype(np.uint8)
 
-        mask = np.zeros((H, W), dtype=bool)
-        mask[margin:H - margin, margin:W - margin] = True
+        # --- NOWY KOD MASKI ROI ---
+        if roi_mask is not None:
+            # Zmniejszamy maskę ROI o nasz margines (erozja), żeby odciąć same brzegi
+            se_size = max(3, margin * 2 + 1)
+            se = self._get_structuring_element(se_size, 'ellipse')
+            mask_u8 = (roi_mask.astype(np.uint8) * 255)
+            safe_roi = self._erode(mask_u8, se) > 0
+            mask = safe_roi
+        else:
+            # Stare zachowanie (kwadratowy margines), jeśli maski nie podano
+            mask = np.zeros((H, W), dtype=bool)
+            mask[margin:H - margin, margin:W - margin] = True
+            
         mask &= (s == 1)
+
+        # ... (reszta kodu z raw_terminations i bifurcations zostaje bez zmian) ...
 
         raw_terminations = [tuple(pt) for pt in np.argwhere(mask & (cn == 1))]
         bifurcations = [tuple(pt) for pt in np.argwhere(mask & (cn == 3))]
@@ -484,7 +636,7 @@ class FingerprintProcessor:
 
 
     # old method for drawing - makes circles
-    def __draw_minutiae(self, skeleton: np.ndarray, minutiae: dict, radius: int = 4) -> np.ndarray:
+    def old_draw_minutiae(self, skeleton: np.ndarray, minutiae: dict, radius: int = 4) -> np.ndarray:
         """
         Overlays the detected minutiae onto the skeleton image in RGB format.
         Terminations = Red, Bifurcations = Blue.
